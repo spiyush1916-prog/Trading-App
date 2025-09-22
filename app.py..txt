@@ -1,0 +1,375 @@
+# Set page config for better website look
+st.set_page_config(page_title="AI Trading Bot", page_icon="📈", layout="wide")
+
+# CSS for mobile-friendly styling
+st.markdown("""
+<style>
+    .main { padding: 10px; }
+    .stButton>button { width: 100%; }
+    .stTextInput>div>input { width: 100%; }
+    .stSelectbox>div>select { width: 100%; }
+    .stMetric { font-size: 1.2em; }
+    @media (max-width: 600px) {
+        .stMetric { font-size: 1em; }
+        h1, h2, h3 { font-size: 1.5em; }
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Function to calculate EMA
+def calculate_ema(data, window):
+    return data.ewm(span=window, adjust=False).mean()
+
+# Function to calculate RSI
+def calculate_rsi(data, window):
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# Function to calculate MACD
+def calculate_macd(data, short_window, long_window, signal_window):
+    short_ema = calculate_ema(data, short_window)
+    long_ema = calculate_ema(data, long_window)
+    macd = short_ema - long_ema
+    signal = calculate_ema(macd, signal_window)
+    return macd, signal
+
+# Function to calculate Bollinger Bands
+def calculate_bb(data, window):
+    ma = data.rolling(window).mean()
+    std = data.rolling(window).std()
+    upper_bb = ma + 2 * std
+    middle_bb = ma
+    lower_bb = ma - 2 * std
+    return upper_bb, middle_bb, lower_bb
+
+# Rule-based signal
+def get_rule_signal(row):
+    if row['rsi'] < 30 and row['macd'] > row['signal'] and row['Close'] < row['lower_bb']:
+        return 'buy'
+    elif row['rsi'] > 70 and row['macd'] < row['signal'] and row['Close'] > row['upper_bb']:
+        return 'sell'
+    else:
+        return 'hold'
+
+# ML model definition
+class TradingModel(nn.Module):
+    def __init__(self, input_dim):
+        super(TradingModel, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 32)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Linear(32, 16)
+        self.relu2 = nn.ReLU()
+        self.fc3 = nn.Linear(16, 3)  # 0: sell, 1: hold, 2: buy
+
+    def forward(self, x):
+        x = self.relu1(self.fc1(x))
+        x = self.relu2(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+# Function to get ML signals (walk-forward)
+def get_ml_signals(df, features_cols, min_train=50, epochs=20, lr=0.01):
+    signals = ['hold'] * len(df)
+    for i in range(min_train, len(df)):
+        train_df = df.iloc[:i]
+        X_train = train_df[features_cols].values
+        y_train = train_df['label'].values
+        
+        mean = np.mean(X_train, axis=0)
+        std = np.std(X_train, axis=0) + 1e-8
+        X_train_norm = (X_train - mean) / std
+        
+        X_train_t = torch.tensor(X_train_norm, dtype=torch.float32)
+        y_train_t = torch.tensor(y_train, dtype=torch.long)
+        
+        model = TradingModel(len(features_cols))
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            out = model(X_train_t)
+            loss = criterion(out, y_train_t)
+            loss.backward()
+            optimizer.step()
+        
+        X_new = df[features_cols].iloc[i:i+1].values
+        X_new_norm = (X_new - mean) / std
+        X_new_t = torch.tensor(X_new_norm, dtype=torch.float32)
+        with torch.no_grad():
+            pred = model(X_new_t)
+            signal_idx = torch.argmax(pred, dim=1).item()
+        signals[i] = ['sell', 'hold', 'buy'][signal_idx]
+    
+    return signals
+
+# Function to get current ML prediction
+def get_current_ml_prediction(df, features_cols, epochs=20, lr=0.01):
+    if len(df) < 50:
+        return 'hold'
+    
+    train_df = df.iloc[:-1]
+    X_train = train_df[features_cols].values
+    y_train = train_df['label'].values
+    
+    mean = np.mean(X_train, axis=0)
+    std = np.std(X_train, axis=0) + 1e-8
+    X_train_norm = (X_train - mean) / std
+    
+    X_train_t = torch.tensor(X_train_norm, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.long)
+    
+    model = TradingModel(len(features_cols))
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        out = model(X_train_t)
+        loss = criterion(out, y_train_t)
+        loss.backward()
+        optimizer.step()
+    
+    X_new = df[features_cols].iloc[-1:].values
+    X_new_norm = (X_new - mean) / std
+    X_new_t = torch.tensor(X_new_norm, dtype=torch.float32)
+    with torch.no_grad():
+        pred = model(X_new_t)
+        signal_idx = torch.argmax(pred, dim=1).item()
+    return ['sell', 'hold', 'buy'][signal_idx]
+
+# Backtesting function
+def run_backtest(df, initial_capital=10000, strategy='rule'):
+    if strategy == 'rule':
+        df['signal'] = df.apply(get_rule_signal, axis=1)
+    else:
+        df['signal'] = get_ml_signals(df, features_cols)
+    
+    position = 0
+    entry_price = 0
+    portfolio = initial_capital
+    equity = [initial_capital]
+    trades = []
+    
+    for i in range(1, len(df)):
+        current_price = df['Close'].iloc[i]
+        signal = df['signal'].iloc[i]
+        
+        if signal == 'buy' and position == 0:
+            shares = portfolio / current_price
+            entry_price = current_price
+            position = 1
+            trades.append({'type': 'buy', 'price': current_price, 'time': df.index[i]})
+        
+        elif signal == 'sell' and position == 1:
+            profit = (current_price - entry_price) * shares
+            portfolio += profit
+            position = 0
+            trades.append({'type': 'sell', 'price': current_price, 'time': df.index[i], 'profit': profit})
+        
+        if position == 1:
+            current_value = shares * current_price
+        else:
+            current_value = portfolio
+        equity.append(current_value)
+    
+    if position == 1:
+        current_price = df['Close'].iloc[-1]
+        profit = (current_price - entry_price) * shares
+        portfolio += profit
+        trades.append({'type': 'sell (forced)', 'price': current_price, 'time': df.index[-1], 'profit': profit})
+    
+    df['equity'] = equity + [equity[-1]] if len(equity) < len(df) else equity
+    
+    total_return = (portfolio - initial_capital) / initial_capital * 100
+    num_trades = len([t for t in trades if t['type'].startswith('sell')])
+    wins = len([t for t in trades if t['type'].startswith('sell') and 'profit' in t and t['profit'] > 0])
+    win_rate = (wins / num_trades * 100) if num_trades > 0 else 0
+    
+    return {
+        'final_portfolio': portfolio,
+        'total_return': total_return,
+        'num_trades': num_trades,
+        'win_rate': win_rate,
+        'trades': trades
+    }, df
+
+# Main app
+st.title("📈 AI Trading Bot - Crypto & Forex Analysis")
+st.warning("""
+This app is for educational and entertainment purposes only. It does not constitute financial advice. 
+Trading in crypto and forex involves significant risk of loss. Always do your own research and consult professionals.
+""")
+
+# Input section
+col1, col2 = st.columns([1, 1])
+with col1:
+    asset_type = st.selectbox("Select Asset Type", ["Crypto", "Forex"])
+with col2:
+    if asset_type == "Crypto":
+        symbol = st.text_input("Enter Crypto Symbol (e.g., BTC/USDT)", value="BTC/USDT")
+    else:
+        symbol = st.text_input("Enter Forex Symbol (e.g., EURUSD=X)", value="EURUSD=X")
+
+col3, col4, col5 = st.columns([1, 1, 1])
+with col3:
+    timeframe = st.selectbox("Select Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=4)
+with col4:
+    limit = st.number_input("Number of Data Points", min_value=50, max_value=500, value=100)
+with col5:
+    initial_capital = st.number_input("Initial Capital ($)", min_value=1000, value=10000)
+strategy = st.selectbox("Select Strategy", ["Rule-based", "ML-based"])
+
+if st.button("Analyze Chart and Run Backtest"):
+    with st.spinner("Fetching data and running analysis..."):
+        try:
+            if asset_type == "Crypto":
+                exchange = ccxt.binance()
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+            else:
+                period = "1mo" if timeframe in ["1m", "5m", "15m"] else "3mo"
+                df = yf.download(symbol, period=period, interval=timeframe)
+            
+            if df.empty:
+                st.error("No data fetched. Check symbol and timeframe.")
+            else:
+                # Calculate indicators
+                df['rsi'] = calculate_rsi(df['Close'], 14)
+                df['macd'], df['signal'] = calculate_macd(df['Close'], 12, 26, 9)
+                df['upper_bb'], df['middle_bb'], df['lower_bb'] = calculate_bb(df['Close'], 20)
+                df['ma20'] = df['Close'].rolling(20).mean()
+                
+                # Prepare ML features and labels
+                df['macd_hist'] = df['macd'] - df['signal']
+                df['bb_position'] = (df['Close'] - df['lower_bb']) / (df['upper_bb'] - df['lower_bb'])
+                features_cols = ['rsi', 'macd', 'macd_hist', 'bb_position']
+                
+                horizon = 1
+                df['future_return'] = df['Close'].pct_change(horizon).shift(-horizon)
+                df['label'] = np.where(df['future_return'] > 0.005, 2, np.where(df['future_return'] < -0.005, 0, 1))
+                df.dropna(subset=features_cols + ['label'], inplace=True)
+                
+                if len(df) < 50:
+                    st.error("Not enough data points after processing. Try increasing limit.")
+                else:
+                    # Current recommendation
+                    if strategy == 'rule':
+                        last_row = df.iloc[-1]
+                        current_signal = get_rule_signal(last_row)
+                    else:
+                        current_signal = get_current_ml_prediction(df, features_cols)
+                    rec = f"{current_signal.capitalize()} - Based on latest data using {strategy} strategy."
+                    st.subheader("AI Analysis Recommendation (Current)")
+                    st.write(rec)
+                    
+                    # Display key metrics
+                    st.subheader("Key Indicators (Latest Values)")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("RSI (14)", f"{df['rsi'].iloc[-1]:.2f}")
+                    with col2:
+                        st.metric("MACD", f"{df['macd'].iloc[-1]:.2f}")
+                        st.metric("MACD Signal", f"{df['signal'].iloc[-1]:.2f}")
+                    with col3:
+                        st.metric("Upper BB", f"{df['upper_bb'].iloc[-1]:.2f}")
+                        st.metric("Lower BB", f"{df['lower_bb'].iloc[-1]:.2f}")
+                    
+                    # Run backtest
+                    backtest_results, df_with_equity = run_backtest(df, initial_capital, strategy.lower())
+                    
+                    st.subheader(f"Backtest Results ({strategy})")
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Final Portfolio", f"${backtest_results['final_portfolio']:.2f}")
+                    with col2:
+                        st.metric("Total Return (%)", f"{backtest_results['total_return']:.2f}%")
+                    with col3:
+                        st.metric("Number of Trades", backtest_results['num_trades'])
+                    with col4:
+                        st.metric("Win Rate (%)", f"{backtest_results['win_rate']:.2f}%")
+                    
+                    st.subheader("Trade Log")
+                    trade_df = pd.DataFrame(backtest_results['trades'])
+                    if not trade_df.empty:
+                        st.dataframe(trade_df)
+                    else:
+                        st.write("No trades executed in this period.")
+                    
+                    # Equity curve
+                    st.subheader("Equity Curve")
+                    fig, ax = plt.subplots(figsize=(10, 4))
+                    ax.plot(df_with_equity.index, df_with_equity['equity'])
+                    ax.set_title("Portfolio Equity Over Time")
+                    ax.set_xlabel("Time")
+                    ax.set_ylabel("Equity ($)")
+                    plt.xticks(rotation=45)
+                    st.pyplot(fig)
+                    
+                    # Chart data preparation
+                    candle_data = []
+                    ma_data = []
+                    for idx, row in df.iterrows():
+                        time_str = idx.strftime('%Y-%m-%d %H:%M:%S') if timeframe != '1d' else idx.strftime('%Y-%m-%d')
+                        candle_data.append({
+                            "time": time_str,
+                            "open": row['Open'],
+                            "high": row['High'],
+                            "low": row['Low'],
+                            "close": row['Close']
+                        })
+                        if not pd.isna(row['ma20']):
+                            ma_data.append({"time": time_str, "value": row['ma20']})
+                    
+                    chart_options = {
+                        "layout": {
+                            "textColor": 'black',
+                            "background": {
+                                "type": 'solid',
+                                "color": 'white'
+                            }
+                        },
+                        "width": 800,
+                        "height": 400
+                    }
+                    
+                    series = [
+                        {
+                            "type": 'Candlestick',
+                            "data": candle_data,
+                            "options": {}
+                        },
+                        {
+                            "type": 'Line',
+                            "data": ma_data,
+                            "options": {"color": 'blue', "lineWidth": 2}
+                        }
+                    ]
+                    
+                    st.subheader("TradingView-Style Chart")
+                    try:
+                        from streamlit_lightweight_charts import renderLightweightCharts
+                        renderLightweightCharts([{"chart": chart_options, "series": series}], 'candlestick')
+                    except Exception as e:
+                        st.warning("Chart rendering failed. Try refreshing or checking library installation.")
+                    
+                    # Raw data
+                    st.subheader("Raw Data (Last 10)")
+                    st.dataframe(df.tail(10))
+        
+        except Exception as e:
+            st.error(f"Error: {str(e)}. Please check your inputs or try a different symbol/exchange.")
+
+st.info("""
+**About This App**  
+- Built for crypto and forex trading analysis with TradingView-style charts.  
+- Features: Rule-based and ML-based strategies, backtesting, real-time data (via ccxt/yfinance).  
+- Deployed on Streamlit Cloud for web access.  
+- For issues, check GitHub repo or contact support.  
+""")
